@@ -1,0 +1,5 @@
+flask
+torch
+torch-geometric
+firebase-admin
+pandas
