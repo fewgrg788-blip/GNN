@@ -6,63 +6,65 @@ import firebase_admin
 from firebase_admin import credentials, db
 from flask import Flask
 
-# --- 1. GNN 模型結構 (必須與訓練時一致) ---
-# 根據你的 JS，輸入特徵為 5 個: [mq135.norm, mq2.norm, mq7.norm, temp, humidity]
+# --- 1. 定義模型結構 (5 維輸入) ---
 class BuildTechGNN(torch.nn.Module):
     def __init__(self, input_dim=5, hidden_dim=16, output_dim=1):
         super(BuildTechGNN, self).__init__()
-        try:
-            from torch_geometric.nn import GCNConv
-            self.conv1 = GCNConv(input_dim, hidden_dim)
-            self.conv2 = GCNConv(hidden_dim, output_dim)
-        except ImportError:
-            # 如果環境沒裝好 torch-geometric 的備用簡單層
-            self.conv1 = torch.nn.Linear(input_dim, hidden_dim)
-            self.conv2 = torch.nn.Linear(hidden_dim, output_dim)
+        # 使用 Linear 確保即使沒裝 torch-geometric 也能啟動進行測試
+        self.conv1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.conv2 = torch.nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
+    def forward(self, x, edge_index=None):
+        x = self.conv1(x)
         x = torch.relu(x)
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x)
         return x
 
-# --- 2. 初始化環境 ---
+# --- 2. 初始化環境變數 ---
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATUS = {"model": "Loading...", "firebase": "Connecting...", "error": "None"}
 
-# Firebase 初始化 (使用你指定的 asia-southeast1 網址)
-if not firebase_admin._apps:
-    cred_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
-    })
+# --- 3. 核心函數：載入模型與 Firebase ---
+def initialize_system():
+    global gnn_model
+    # A. 載入 Firebase
+    try:
+        cred_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
+        if os.path.exists(cred_path):
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred, {
+                    'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
+                })
+            STATUS["firebase"] = "Connected"
+            # 啟動監聽器
+            db.reference('56214328/latest').listen(run_gnn_prediction)
+        else:
+            STATUS["firebase"] = "Error: serviceAccountKey.json not found"
+    except Exception as e:
+        STATUS["firebase"] = f"Error: {str(e)}"
 
-# 載入模型權重
-def load_model():
-    model = BuildTechGNN(input_dim=5, hidden_dim=16, output_dim=1)
-    model_path = os.path.join(BASE_DIR, "model.pth")
-    if os.path.exists(model_path):
-        try:
-            model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-            print("✅ GNN Model Weights Loaded")
-        except Exception as e:
-            print(f"⚠️ Model load error: {e}")
-    model.eval()
-    return model
+    # B. 載入模型
+    gnn_model = BuildTechGNN(input_dim=5)
+    try:
+        model_path = os.path.join(BASE_DIR, "model.pth")
+        if os.path.exists(model_path):
+            gnn_model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+            gnn_model.eval()
+            STATUS["model"] = "Loaded"
+        else:
+            STATUS["model"] = "Error: model.pth not found"
+    except Exception as e:
+        STATUS["model"] = f"Error: {str(e)}"
 
-gnn_model = load_model()
-
-# --- 3. 核心監聽與預測函數 ---
+# --- 4. GNN 預測邏輯 ---
 def run_gnn_prediction(event):
-    """
-    當 firebase.js 更新 '56214328/latest' 時，此函數會自動觸發
-    """
     data = event.data
-    if data is None: return
+    if data is None or gnn_model is None: return
 
     try:
-        # 1. 依照 firebase.js 結構精確提取數據
+        # 根據你的 firebase.js 結構提取
         sensors = data.get('sensors', {})
         mq135 = sensors.get('mq135', {}).get('norm', 0)
         mq2   = sensors.get('mq2', {}).get('norm', 0)
@@ -72,43 +74,40 @@ def run_gnn_prediction(event):
         temp = weather.get('temp', 0)
         hum  = weather.get('humidity', 0)
 
-        # 2. 構建 Tensor (5 個特徵)
-        # 格式: [[mq135, mq2, mq7, temp, hum]]
+        # 轉換為 5 維 Tensor
         x = torch.tensor([[mq135, mq2, mq7, temp, hum]], dtype=torch.float)
         
-        # 3. 靜態圖結構 (單節點自環，適用於單站點監控)
-        edge_index = torch.tensor([[0], [0]], dtype=torch.long)
-
-        # 4. 執行 AI 預測
         with torch.no_grad():
-            prediction = gnn_model(x, edge_index)
+            prediction = gnn_model(x)
             score = prediction.item()
 
-        # 5. 寫回結果到 ai_analysis
+        # 寫回 Firebase
         db.reference('56214328/ai_analysis').update({
             "current_prediction": round(score, 4),
-            "status": "Warning" if score > 0.5 else "Safe", # 閾值可依需求調整
+            "status": "Safe" if score < 0.5 else "Warning",
             "last_calc_time": datetime.datetime.now().isoformat()
         })
-        print(f"🚀 [GNN Update] Score: {round(score,4)} | Data: T:{temp} H:{hum}")
-
+        print(f"Prediction Updated: {score}")
     except Exception as e:
-        print(f"❌ Prediction Logic Error: {e}")
+        print(f"Prediction Error: {e}")
 
-# --- 4. 運行與監控 ---
+# --- 5. Flask 路由 (讓 Render 偵測到服務) ---
 @app.route('/')
-def home():
-    return "BuildTech AI Node is Live", 200
+def health():
+    return {
+        "service": "BuildTech GNN Node",
+        "firebase_status": STATUS["firebase"],
+        "model_status": STATUS["model"],
+        "timestamp": datetime.datetime.now().isoformat()
+    }, 200
 
-def start_listener():
-    # 監聽路徑必須與 firebase.js 推送的路徑完全一致
-    print("📡 Monitoring Firebase path: 56214328/latest")
-    db.reference('56214328/latest').listen(run_gnn_prediction)
-
+# --- 6. 啟動入口 ---
 if __name__ == "__main__":
-    # 啟動背景監聽線程
-    threading.Thread(target=start_listener, daemon=True).start()
-    
-    # 啟動 Flask (Render 偵測 Port 10000)
+    # 使用 Thread 初始化，避免阻塞 Flask 啟動
+    init_thread = threading.Thread(target=initialize_system)
+    init_thread.start()
+
+    # 立即啟動 Flask
     port = int(os.environ.get("PORT", 10000))
+    print(f"Starting Web Server on port {port}...")
     app.run(host='0.0.0.0', port=port)
