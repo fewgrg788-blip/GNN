@@ -1,5 +1,4 @@
 flask
-torch
+torch --index-url https://download.pytorch.org/whl/cpu
 torch-geometric
 firebase-admin
-pandas
