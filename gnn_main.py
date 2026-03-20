@@ -1,41 +1,38 @@
 import os
-import threading
 import torch
 import datetime
 import firebase_admin
 from firebase_admin import credentials, db
 from flask import Flask
 
-# --- 1. 模型結構 ---
+# --- 1. 先定義模型結構 ---
 class BuildTechGNN(torch.nn.Module):
     def __init__(self, input_dim=5, hidden_dim=16, output_dim=1):
         super(BuildTechGNN, self).__init__()
-        self.conv1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.conv2 = torch.nn.Linear(hidden_dim, output_dim)
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = self.conv2(x)
-        return x
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+# --- 2. 立即初始化模型實例 (防止 NameError) ---
+# 這樣一啟動，gnn_model 就已經存在於記憶體中
+gnn_model = BuildTechGNN(input_dim=5)
+gnn_model.eval()
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATUS = {"model": "Loading...", "firebase": "Connecting...", "last_data": "None"}
+STATUS = {"model": "Initial", "firebase": "Idle", "last_update": "None"}
 
-# --- 2. 核心監聽邏輯 ---
 def run_gnn_prediction(event):
-    """當 Firebase 數據變動時觸發"""
-    print(f"🔔 [Firebase Event] 偵測到數據變動: {event.path}")
+    """Firebase 監聽回調"""
+    # 這裡直接使用全域的 gnn_model
     data = event.data
-    if data is None: 
-        print("⚠️ 收到空數據，跳過")
-        return
+    if data is None: return
 
     try:
-        # 紀錄最後收到的數據時間
-        STATUS["last_data"] = datetime.datetime.now().isoformat()
-        
-        # 解析數據 (嚴格對應你的 JSON 結構)
+        print(f"📥 接收數據變動: {datetime.datetime.now()}")
         sensors = data.get('sensors', {})
         mq135 = sensors.get('mq135', {}).get('norm', 0)
         mq2   = sensors.get('mq2', {}).get('norm', 0)
@@ -45,40 +42,37 @@ def run_gnn_prediction(event):
         temp = weather.get('temp', 0)
         hum  = weather.get('humidity', 0)
 
-        print(f"📊 處理中: MQ135({mq135}), MQ2({mq2}), MQ7({mq7}), T({temp}), H({hum})")
-
-        # 轉為 Tensor 並預測
+        # 執行 AI 預測
         x = torch.tensor([[mq135, mq2, mq7, temp, hum]], dtype=torch.float)
         with torch.no_grad():
             score = gnn_model(x).item()
 
-        # 寫回 Firebase (注意路徑：我們直接寫在 56214328 下面)
-        result_ref = db.reference('56214328/ai_analysis')
-        result_data = {
+        # 寫回 Firebase
+        db.reference('56214328/ai_analysis').update({
             "current_prediction": round(score, 4),
             "status": "Warning" if score > 0.5 else "Safe",
-            "last_calc_time": datetime.datetime.now().isoformat()
-        }
-        result_ref.update(result_data)
-        print(f"✅ 預測成功並寫回 Firebase: {score}")
-
+            "last_calc_time": datetime.datetime.now().isoformat(),
+            "engine": "BuildTech-Render-GNN"
+        })
+        STATUS["last_update"] = datetime.datetime.now().isoformat()
+        print(f"✅ 預測成功: {score}")
     except Exception as e:
-        print(f"❌ 預測執行出錯: {e}")
+        print(f"❌ 預測錯誤: {e}")
 
-# --- 3. 啟動與初始化 ---
-def initialize_system():
-    global gnn_model
-    # 初始化模型
-    gnn_model = BuildTechGNN(input_dim=5)
+# --- 3. 系統啟動函數 ---
+def start_app():
+    # A. 載入模型權重
     model_path = os.path.join(BASE_DIR, "model.pth")
     if os.path.exists(model_path):
-        gnn_model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-        STATUS["model"] = "Loaded"
+        try:
+            gnn_model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+            STATUS["model"] = "Loaded"
+        except Exception as e:
+            STATUS["model"] = f"Weight Error: {e}"
     else:
-        STATUS["model"] = "Error: model.pth missing"
-    gnn_model.eval()
+        STATUS["model"] = "No pth file, using random weights"
 
-    # 初始化 Firebase
+    # B. 連接 Firebase 並開始監聽
     try:
         cred_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
         if not firebase_admin._apps:
@@ -87,10 +81,9 @@ def initialize_system():
                 'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
             })
         STATUS["firebase"] = "Connected"
-        
-        # ⚠️ 關鍵：開始監聽
-        print("📡 開始監聽路徑: 56214328/latest")
+        # 啟動監聽器
         db.reference('56214328/latest').listen(run_gnn_prediction)
+        print("📡 Firebase 監聽器已掛載")
     except Exception as e:
         STATUS["firebase"] = f"Error: {e}"
 
@@ -99,7 +92,8 @@ def health():
     return STATUS, 200
 
 if __name__ == "__main__":
-    # 先跑初始化再開網頁
-    initialize_system()
+    # 1. 先執行系統初始化
+    start_app()
+    # 2. 再啟動 Flask 服務
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
