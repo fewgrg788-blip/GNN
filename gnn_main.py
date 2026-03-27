@@ -5,85 +5,121 @@ import firebase_admin
 from firebase_admin import credentials, db
 from flask import Flask
 
-# 从 models 文件夹导入你的模型类
-from models.lan_gnn import BuildTechGNN
-from models.wan_gnn import WAN_GNN
+# 從自定義模組導入模型類 [cite: 1]
+try:
+    from models.lan_gnn import BuildTechGNN
+    from models.wan_gnn import WAN_GNN
+    print("✅ [System] Models modules imported successfully.")
+except ImportError as e:
+    print(f"❌ [System] Import Error: {e}")
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATUS = {"firebase": "Initializing...", "lan_model": "Initial", "wan_model": "Initial"}
 
-# --- 1. 初始化模型实例 ---
-# 假设 LAN 输入 5 维，WAN 输入 18 维（请根据你的训练参数调整）
-lan_engine = BuildTechGNN(input_dim=5)
+# 系統狀態追蹤
+STATUS = {
+    "firebase": "Initializing...",
+    "lan_model": "Initial",
+    "wan_model": "Initial",
+    "last_run": "None"
+}
+
+# --- 1. 初始化模型實例 ---
+# 確保維度與你訓練 .pth 時一致 [cite: 1]
+lan_engine = BuildTechGNN(input_dim=5) 
 wan_engine = WAN_GNN(input_dim=18)
 
-# --- 2. 核心计算分发器 ---
+# --- 2. 核心預測邏輯 ---
 def handle_prediction(event):
     path = event.path
     data = event.data
-    if not data: return
+    if not data:
+        return
+
+    now_str = datetime.datetime.now().isoformat()
+    print(f"\n--- [Event] Data change detected at {path} ---")
 
     try:
-        # 情况 A: 处理来自硬件 (ESP32) 的 LAN 数据
-        if "latest_hardware" in path or "sensors" in str(path):
-            print("🔌 Processing LAN Data (MQ135/Sensors)...")
-            # 提取数据 (参考你之前的逻辑)
-            sensors = data.get('sensors', data) # 兼容不同路径结构
+        # 🟢 情況 A: 處理 LAN 數據 (來自 ESP32 傳感器)
+        if "sensors" in path or ("latest" in path and data.get("sensors")):
+            print("🔍 [LAN] Extracting sensor features...")
+            sensors = data.get('sensors', data)
+            weather = data.get('weather', {})
+            
+            # 構建特徵向量 [mq135, mq2, mq7, temp, hum]
             features = [
                 sensors.get('mq135', {}).get('norm', 0),
                 sensors.get('mq2', {}).get('norm', 0),
                 sensors.get('mq7', {}).get('norm', 0),
-                sensors.get('temp', 25) / 50.0,
-                sensors.get('hum', 50) / 100.0
+                weather.get('temp', 25),
+                weather.get('humidity', 50)
             ]
-            input_tensor = torch.tensor([features], dtype=torch.float32)
-            with torch.no_grad():
-                score = lan_engine(input_tensor).item()
             
-            db.reference('56214328/results/lan_score').set({
-                "score": round(score, 4),
-                "time": datetime.datetime.now().isoformat()
+            x = torch.tensor([features], dtype=torch.float32)
+            with torch.no_grad():
+                score = lan_engine(x).item()
+            
+            print(f"🎯 [LAN] Prediction Score: {score:.4f}")
+            
+            # 寫回 Firebase
+            db.reference('56214328/ai_analysis').update({
+                "current_prediction": round(score, 4),
+                "status": "Warning" if score > 0.5 else "Safe",
+                "last_calc_time": now_str,
+                "engine": "BuildTech-LAN-GNN"
             })
 
-        # 情况 B: 处理来自 API 的 WAN 数据 (全港)
+        # 🔵 情況 B: 處理 WAN 數據 (來自 GitHub Action 的全港 API)
         elif "latest_api" in path:
-            print("🛰️ Processing WAN Data (Hong Kong AQHI)...")
-            # 假设数据是 18 个站点的数值列表
-            features = list(data.values()) 
-            input_tensor = torch.tensor([features], dtype=torch.float32)
-            with torch.no_grad():
-                score = wan_engine(input_tensor).item()
+            print("🔍 [WAN] Extracting Hong Kong station features...")
+            # 假設數據是 18 個站點的數值字典
+            features = [float(v) for v in data.values()]
             
-            db.reference('56214328/results/wan_score').set({
-                "score": round(score, 4),
-                "time": datetime.datetime.now().isoformat()
-            })
+            if len(features) == 18:
+                x = torch.tensor([features], dtype=torch.float32)
+                with torch.no_grad():
+                    score = wan_engine(x).item()
+                
+                print(f"🎯 [WAN] Regional Score: {score:.4f}")
+                db.reference('56214328/regional_analysis').set({
+                    "score": round(score, 4),
+                    "timestamp": now_str,
+                    "engine": "BuildTech-WAN-GNN"
+                })
+            else:
+                print(f"⚠️ [WAN] Data dimension mismatch. Expected 18, got {len(features)}")
+
+        STATUS["last_run"] = now_str
 
     except Exception as e:
-        print(f"❌ Prediction Error: {e}")
+        print(f"❌ [Error] Prediction Loop Failed: {e}")
 
-# --- 3. 系统启动与权重加载 ---
+# --- 3. 系統啟動函數 ---
 def start_system():
-    # 載入 LAN 權重
-    lan_weight = os.path.join(BASE_DIR, "weights", "model_lan.pth")
-    if os.path.exists(lan_weight):
-        try:
-            lan_engine.load_state_dict(torch.load(lan_weight, map_location='cpu'))
-            lan_engine.eval()
-            STATUS["lan_model"] = "Loaded"
-        except Exception as e: STATUS["lan_model"] = f"Error: {e}"
+    print("🚀 [System] Starting BuildTech GNN Engine...")
 
-    # 載入 WAN 權重
-    wan_weight = os.path.join(BASE_DIR, "weights", "hk_pro_model_final.pth")
-    if os.path.exists(wan_weight):
-        try:
-            wan_engine.load_state_dict(torch.load(wan_weight, map_location='cpu'))
-            wan_engine.eval()
-            STATUS["wan_model"] = "Loaded"
-        except Exception as e: STATUS["wan_model"] = f"Error: {e}"
+    # A. 載入權重
+    paths = {
+        "lan": os.path.join(BASE_DIR, "weights", "model_lan.pth"),
+        "wan": os.path.join(BASE_DIR, "weights", "hk_pro_model_final.pth")
+    }
 
-    # Firebase 連接
+    for key, p in paths.items():
+        if os.path.exists(p):
+            try:
+                model = lan_engine if key == "lan" else wan_engine
+                model.load_state_dict(torch.load(p, map_location='cpu'))
+                model.eval()
+                STATUS[f"{key}_model"] = "Loaded Successfully"
+                print(f"📦 [System] {key.upper()} weights loaded from {p}")
+            except Exception as e:
+                STATUS[f"{key}_model"] = f"Load Error: {e}"
+                print(f"❌ [System] Failed to load {key} weights: {e}")
+        else:
+            STATUS[f"{key}_model"] = "File not found"
+            print(f"⚠️ [System] Weight file missing: {p}")
+
+    # B. 連接 Firebase [cite: 1]
     try:
         cred_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
         if not firebase_admin._apps:
@@ -92,19 +128,23 @@ def start_system():
                 'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
             })
         STATUS["firebase"] = "Connected"
-        # 監聽整個項目路徑以捕捉不同類型的數據更新
+        print("🔥 [System] Firebase real-time listener active.")
+        
+        # 監聽整個項目根目錄 [cite: 1]
         db.reference('56214328').listen(handle_prediction)
     except Exception as e:
-        STATUS["firebase"] = f"Failed: {e}"
+        STATUS["firebase"] = f"Connection Failed: {e}"
+        print(f"❌ [System] Firebase Error: {e}")
 
 @app.route('/')
 def health_check():
     return {
-        "status": "BuildTech GNN Engine Running",
-        "models": { "LAN": STATUS["lan_model"], "WAN": STATUS["wan_model"] },
-        "firebase": STATUS["firebase"]
-    }
+        "engine_status": STATUS,
+        "server_time": datetime.datetime.now().isoformat()
+    }, 200
 
 if __name__ == '__main__':
     start_system()
-    app.run(host='0.0.0.0', port=10000)
+    # Render 環境變量端口 [cite: 1]
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
