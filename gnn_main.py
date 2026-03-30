@@ -1,78 +1,121 @@
 import os
 import sys
 import json
+import datetime
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from flask import Flask, jsonify
 
-# --- 1. 核心路徑修正 (解決 Render 找不到 models 導出問題) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+if BASE_DIR not in sys.path: sys.path.insert(0, BASE_DIR)
 
-# --- 2. 導入你的 GNN 模型 ---
+# --- 导入双模型 ---
 try:
     from models.lan_gnn import BuildTechGNN
     from models.wan_gnn import WAN_GNN
-    print("✅ [System] Models imported successfully")
-except ImportError as e:
-    print(f"❌ [System] Import Error: {e}")
-    print(f"🔍 [Debug] Current Sys Path: {sys.path}")
+    lan_engine = BuildTechGNN() # 假设这是你的 LAN 模型初始化
+    wan_engine = WAN_GNN()      # 假设这是你的 WAN 模型初始化
+    print("✅ [AI] Both LAN & WAN Engines Loaded")
+except Exception as e:
+    print(f"❌ [AI] Engine Load Error: {e}")
+    lan_engine, wan_engine = None, None
 
 app = Flask(__name__)
 
-# --- 3. 初始化 Firebase (優先使用環境變量) ---
-def start_firebase():
+# ==========================================
+#  1. LAN 数据处理器 (微观环境 - ESP32)
+# ==========================================
+def handle_lan_data(event):
+    if event.data is None or lan_engine is None: return
     try:
-        fb_config_str = os.environ.get("FIREBASE_CONFIG")
+        data = event.data
+        # 解析你在 JSON 中定义的结构
+        mq135 = data.get('sensors', {}).get('mq135', {}).get('raw', 0)
+        mq2 = data.get('sensors', {}).get('mq2', {}).get('raw', 0)
+        mq7 = data.get('sensors', {}).get('mq7', {}).get('raw', 0)
+        temp = data.get('weather', {}).get('temp', 25)
+        hum = data.get('weather', {}).get('humidity', 50)
         
-        if fb_config_str:
-            print("📦 [System] Using Render Environment Variable for Firebase")
-            # 使用 strict=False 增加 JSON 解析的容錯率
-            fb_config_dict = json.loads(fb_config_str, strict=False)
-            cred = credentials.Certificate(fb_config_dict)
-        else:
-            print("📄 [System] Environment variable not found, using local file")
-            cred_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
-            cred = credentials.Certificate(cred_path)
+        # 运行 LAN 预测
+        lan_pred = lan_engine.predict([mq135, mq2, mq7, temp, hum])
+        
+        status = "Normal"
+        if lan_pred > 15: status = "Warning"
+        if lan_pred > 25: status = "Danger"
 
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
-            })
-        print("🔥 [System] Firebase Connected Successfully")
-        return True
+        # 按照格式写回 Firebase
+        firebase_db.reference("56214328/ai_analysis").update({
+            "current_prediction": round(float(lan_pred), 4),
+            "engine": "BuildTech-LAN-GNN-v2",
+            "last_calc_time": datetime.datetime.utcnow().isoformat() + "Z",
+            "status": status,
+            "trigger_source": "MQ_Sensors"
+        })
+        print(f"🟢 [LAN AI] Updated: {lan_pred:.2f} ({status})")
     except Exception as e:
-        print(f"❌ [System] Firebase Connection Error: {e}")
-        return False
+        print(f"❌ [LAN AI] Error: {e}")
 
-# --- 4. 簡單的 API 路由 (供 Render 存活檢查使用) ---
+# ==========================================
+#  2. WAN 数据处理器 (宏观环境 - 18区数据)
+# ==========================================
+def handle_wan_data(event):
+    if event.data is None or wan_engine is None: return
+    try:
+        readings = event.data.get('readings', {})
+        
+        # 提取 18 区的值转换为列表 (Causeway Bay, Central, etc.)
+        # 你的 JSON 中值是字符串 "4", "2", 需要转为整数或浮点数
+        features = [float(val) for key, val in readings.items()]
+        
+        # 运行 WAN 预测 (例如预测未来一小时的全港平均 AQHI)
+        wan_pred = wan_engine.predict(features)
+        
+        status = "Good"
+        if wan_pred >= 4: status = "Moderate"
+        if wan_pred >= 7: status = "High Risk"
+
+        # 写回 GAGNN_24hours 节点
+        firebase_db.reference("GAGNN_24hours/wan_ai_analysis").update({
+            "territory_avg_prediction": round(float(wan_pred), 4),
+            "engine": "BuildTech-WAN-GNN-v1",
+            "last_calc_time": datetime.datetime.utcnow().isoformat() + "Z",
+            "status": status,
+            "trigger_source": "HK_Gov_API"
+        })
+        print(f"🔵 [WAN AI] Updated: {wan_pred:.2f} ({status})")
+    except Exception as e:
+        print(f"❌ [WAN AI] Error: {e}")
+
+
+# ==========================================
+#  启动与路由
+# ==========================================
+def start_services():
+    fb_config_str = os.environ.get("FIREBASE_CONFIG")
+    if fb_config_str:
+        cred = credentials.Certificate(json.loads(fb_config_str, strict=False))
+    else:
+        cred = credentials.Certificate(os.path.join(BASE_DIR, "serviceAccountKey.json"))
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
+        })
+    
+    # 建立双通道监听 (Dual-Channel Listeners)
+    firebase_db.reference("56214328/latest").listen(handle_lan_data)
+    firebase_db.reference("GAGNN_24hours/GAGNN_data").listen(handle_wan_data)
+    print("📡 [System] Dual-Channel Listeners (LAN & WAN) Started")
+
 @app.route('/')
 def home():
-    try:
-        # 測試讀取一次 Firebase 數據 (56214328 節點)
-        ref = firebase_db.reference("56214328/latest")
-        data = ref.get()
-        return jsonify({
-            "status": "online",
-            "project": "BuildTech GNN Engine",
-            "firebase_connected": True,
-            "latest_data": data
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({
+        "status": "AI Engines Online", 
+        "modules": ["LAN_GNN", "WAN_GNN"],
+        "listeners": "Active"
+    })
 
-# --- 5. 啟動程序 ---
 if __name__ == "__main__":
-    # 先啟動 Firebase
-    connected = start_firebase()
-    
-    # 獲取 Render 分配的端口 (默認 10000)
+    start_services()
     port = int(os.environ.get("PORT", 10000))
-    
-    if connected:
-        print(f"🚀 [BuildTech] GNN Engine starting on port {port}...")
-        # 必須使用 0.0.0.0 才能讓外部訪問
-        app.run(host='0.0.0.0', port=port)
-    else:
-        print("❌ [Critical] Failed to connect to Firebase. System halted.")
+    app.run(host='0.0.0.0', port=port)
