@@ -2,7 +2,7 @@ import os
 import sys
 import json
 import datetime
-import torch  # 必须导入 torch
+import torch  # 必须确保导入了 torch
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from flask import Flask, jsonify
@@ -11,27 +11,27 @@ from flask import Flask, jsonify
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path: sys.path.insert(0, BASE_DIR)
 
-# --- 2. 导入模型并初始化 ---
+# --- 2. 加载模型 ---
 try:
     from models.lan_gnn import BuildTechGNN
     from models.wan_gnn import WAN_GNN
     
-    # 初始化模型实例
-    lan_engine = BuildTechGNN(input_dim=5)
-    wan_engine = WAN_GNN(input_dim=18)
+    # 初始化模型实例 (根据你的源代码，lan 默认 input_dim=5, wan 默认 18)
+    lan_engine = BuildTechGNN()
+    wan_engine = WAN_GNN()
     
-    # 设置为评估模式
+    # 切换到评估模式
     lan_engine.eval()
     wan_engine.eval()
-    print("✅ [AI] LAN (5-dim) & WAN (18-dim) Engines Ready")
+    print("✅ [AI] LAN & WAN 模型已加载并进入 Eval 模式")
 except Exception as e:
-    print(f"❌ [AI] Model Load Error: {e}")
+    print(f"❌ [AI] 加载模型失败: {e}")
     lan_engine, wan_engine = None, None
 
 app = Flask(__name__)
 
 # ==========================================
-#  3. LAN 处理器 (修正调用方式)
+#  3. LAN 处理器 (修复 predict 报错)
 # ==========================================
 def handle_lan_data(event):
     if event.data is None or lan_engine is None: return
@@ -40,7 +40,7 @@ def handle_lan_data(event):
         sensors = data.get('sensors', {})
         weather = data.get('weather', {})
         
-        # 准备 5 个输入特征: [mq135, mq2, mq7, temp, humidity]
+        # 准备 5 个输入特征：[mq135, mq2, mq7, temp, humidity]
         features = [
             float(sensors.get('mq135', {}).get('raw', 0)),
             float(sensors.get('mq2', {}).get('raw', 0)),
@@ -49,34 +49,36 @@ def handle_lan_data(event):
             float(weather.get('humidity', 50))
         ]
         
-        # PyTorch 预测逻辑：转换为 Tensor -> 关闭梯度计算 -> 获取结果
+        # --- 核心修复：使用 PyTorch 的 __call__ 而不是 .predict() ---
         input_tensor = torch.FloatTensor([features])
         with torch.no_grad():
-            prediction = lan_engine(input_tensor)
-            lan_pred = prediction.item() # 获取单数值
+            output = lan_engine(input_tensor) # 直接调用模型对象
+            lan_pred = output.item() 
         
+        # 判断状态
         status = "Normal"
         if lan_pred > 15: status = "Warning"
         if lan_pred > 25: status = "Danger"
 
+        # 写回 Firebase
         firebase_db.reference("56214328/ai_analysis").update({
             "current_prediction": round(float(lan_pred), 4),
-            "engine": "BuildTech-LAN-GNN-v2",
-            "last_calc_time": datetime.datetime.utcnow().isoformat() + "Z",
+            "engine": "BuildTech-LAN-GNN-v2-Fixed",
+            "last_calc_time": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
             "status": status
         })
-        print(f"🟢 [LAN AI] Result: {lan_pred:.2f}")
+        print(f"🟢 [LAN AI] 预测成功: {lan_pred:.4f}")
+
     except Exception as e:
-        print(f"❌ [LAN AI] Inference Error: {e}")
+        print(f"❌ [LAN AI] 运行时错误: {e}")
 
 # ==========================================
-#  4. WAN 处理器 (修正调用方式)
+#  4. WAN 处理器
 # ==========================================
 def handle_wan_data(event):
     if event.data is None or wan_engine is None: return
     try:
         readings = event.data.get('readings', {})
-        # 你的 WAN 模型需要 18 个特征
         features = [float(val) for val in readings.values()]
         
         if len(features) == 18:
@@ -86,15 +88,15 @@ def handle_wan_data(event):
             
             firebase_db.reference("GAGNN_24hours/wan_ai_analysis").update({
                 "territory_avg_prediction": round(float(wan_pred), 4),
-                "last_calc_time": datetime.datetime.utcnow().isoformat() + "Z",
+                "last_calc_time": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
                 "status": "Moderate" if wan_pred < 7 else "High Risk"
             })
-            print(f"🔵 [WAN AI] Result: {wan_pred:.2f}")
+            print(f"🔵 [WAN AI] 预测成功: {wan_pred:.4f}")
     except Exception as e:
-        print(f"❌ [WAN AI] Inference Error: {e}")
+        print(f"❌ [WAN AI] 运行时错误: {e}")
 
 # ==========================================
-#  5. 初始化与监听器
+#  5. 服务启动
 # ==========================================
 def start_services():
     fb_config_str = os.environ.get("FIREBASE_CONFIG")
@@ -108,13 +110,14 @@ def start_services():
             'databaseURL': 'https://project-12cc8-default-rtdb.asia-southeast1.firebasedatabase.app'
         })
     
+    # 注册监听器
     firebase_db.reference("56214328/latest").listen(handle_lan_data)
     firebase_db.reference("GAGNN_24hours/GAGNN_data").listen(handle_wan_data)
-    print("📡 [System] Listeners Active")
+    print("📡 [System] 实时监听通道已激活")
 
 @app.route('/')
 def home():
-    return jsonify({"status": "AI Engine Live", "pytorch_version": torch.__version__})
+    return jsonify({"status": "Online", "engines": "LAN & WAN Active"})
 
 if __name__ == "__main__":
     start_services()
