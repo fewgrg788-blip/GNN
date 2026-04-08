@@ -16,13 +16,12 @@ if BASE_DIR not in sys.path:
 
 print(f"📂 [System] 當前根目錄: {BASE_DIR}")
 
-# 導入架構
 try:
     from models.model_pro import HK_Pro_Model
     from models.lan_gnn import BuildTechGNN
     print("✅ [AI Engine] 成功偵測到 Pro 與 LAN 模型架構定義")
 except ImportError as e:
-    print(f"❌ [Error] 導入失敗: {e}. 請檢查 models/ 是否包含 __init__.py")
+    print(f"❌ [Error] 導入失敗: {e}. 請檢查 models/ 是否包含 __init__.py 和相關模型文件")
 
 app = Flask(__name__)
 DEVICE = torch.device("cpu")
@@ -34,7 +33,33 @@ adj_data = None
 STATION_ORDER = []
 
 # ==========================================
-# 2. AI 引擎初始化 (加載模型與權重)
+# 2. 站點名稱映射字典 (關鍵修復：解決 0.0 問題)
+# ==========================================
+# 將 Firebase 的 key 對應到 adjacency_pyg.pt 的站點名稱邏輯
+# 如果未來名稱有變，只需在這裡修改對應關係
+STATION_MAPPING = {
+    'AQHI_Central/Western': 'Central_Western_General',
+    'AQHI_Eastern': 'Eastern_General',
+    'AQHI_Kwun Tong': 'Kwun_Tong_General',
+    'AQHI_Sham Shui Po': 'Sham_Shui_Po_General',
+    'AQHI_Kwai Chung': 'Kwai_Chung_General',
+    'AQHI_Tsuen Wan': 'Tsuen_Wan_General',
+    'AQHI_Tseung Kwan O': 'Tseung_Kwan_O_General',
+    'AQHI_Yuen Long': 'Yuen_Long_General',
+    'AQHI_Tuen Mun': 'Tuen_Mun_General',
+    'AQHI_Tung Chung': 'Tung_Chung_General',
+    'AQHI_Tai Po': 'Tai_Po_General',
+    'AQHI_Sha Tin': 'Sha_Tin_General',
+    'AQHI_North': 'North_General',
+    'AQHI_Tap Mun': 'Tap_Mun_General',
+    'AQHI_Causeway Bay': 'Causeway_Bay_Roadside',
+    'AQHI_Central': 'Central_Roadside',
+    'AQHI_Mong Kok': 'Mong_Kok_Roadside',
+    'AQHI_Southern': 'Southern_General'
+}
+
+# ==========================================
+# 3. AI 引擎初始化
 # ==========================================
 def init_ai_engine():
     global wan_model, lan_model, adj_data, STATION_ORDER
@@ -74,84 +99,99 @@ def init_ai_engine():
         print(f"❌ [System] 初始化崩潰: {e}")
 
 # ==========================================
-# 3. 預測邏輯 (WAN) 與 反饋迴路
+# 4. 預測邏輯 (WAN) 與 雲端反饋
 # ==========================================
 def handle_wan_data(event):
-    if event.data is None:
-        print("ℹ️ [WAN] 收到空數據更新，忽略處理")
-        return
+    if event.data is None: return
     if wan_model is None:
         print("❌ [WAN] 模型未就緒，無法執行預測")
         return
 
     try:
-        print(f"🔍 [WAN] 偵測到數據變動，路徑: {event.path}")
+        print(f"\n🔍 [WAN] 偵測到數據變動...")
         readings = event.data.get('readings', {})
         
         if not readings:
-            print("⚠️ [WAN] 數據中不包含 readings 欄位")
+            print("⚠️ [WAN] 數據中不包含 readings 欄位，略過分析")
             return
 
-        # 1. 提取並歸一化 (0-10 轉 0-1)
+        # 1. 提取並使用字典映射數據
         curr_vals = []
+        debug_vals = []
         for s in STATION_ORDER:
-            val = float(readings.get(s, 0))
-            curr_vals.append(val / 10.0)
+            # 使用字典尋找對應的 Firebase 鍵值
+            firebase_key = STATION_MAPPING.get(s, s) 
+            
+            # 獲取數值，如果找不到預設為 0
+            val_str = readings.get(firebase_key, 0)
+            val = float(val_str)
+            
+            curr_vals.append(val / 10.0) # 歸一化 (0-1)
+            debug_vals.append(f"{firebase_key}:{val}")
         
-        print(f"📊 [WAN] 已提取 18 區當前數值 (前三名: {STATION_ORDER[:3]} -> {curr_vals[:3]})")
+        print(f"📊 [WAN] 成功提取 18 區實時數據 (前3筆): {debug_vals[:3]}")
 
         # 2. 構造時間序列張量 [1, 18, 24, 3]
-        # (這裡假設構造 24 小時歷史緩存，F=0 是 AQHI)
         history_buffer = np.tile(curr_vals, (24, 1)) 
         input_tensor = torch.zeros((1, 18, 24, 3))
         input_tensor[0, :, :, 0] = torch.FloatTensor(history_buffer).T
         
         # 3. 執行 GNN 推理
-        print("🧠 [WAN] 正在執行時空預測推理...")
+        print("🧠 [WAN] 正在執行時空預測推理 (GAT + GRU)...")
         with torch.no_grad():
             prediction = wan_model(input_tensor, adj_data['edge_index']).numpy()[0]
         
         # 4. 結果計算 (T+6 小時全港平均)
         future_val = np.mean(prediction[:, 5]) * 10.0
-        print(f"🔮 [WAN] 預測完成：6 小時後全港 AQHI 預估為 {future_val:.2f}")
+        current_avg = np.mean(curr_vals) * 10.0
+        print(f"🔮 [WAN] 推理完成 | 當前平均: {current_avg:.2f} -> 6小時後預估: {future_val:.2f}")
 
         # 5. 更新雲端結果
         status_str = "Hazardous" if future_val > 7.0 else "Safe"
         firebase_db.reference("GAGNN_24hours/wan_ai_analysis").update({
+            "territory_avg_current": round(float(current_avg), 2),
             "territory_avg_6h": round(float(future_val), 2),
-            "engine": "GAGNN-Pro-V2-Engine",
-            "last_update": datetime.datetime.now().isoformat(),
+            "engine": "GAGNN-Pro-Hybrid-Engine",
+            "last_update": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
             "status": status_str
         })
 
         # ==========================================
-        # 🟢 新增：反饋邏輯 (Feedback Logic)
-        # 雲端大腦 (WAN) 指揮 硬體終端 (LAN/ESP32)
+        # 🟢 反饋邏輯 (Feedback Loop) -> 指揮 ESP32
         # ==========================================
-        feedback_ref = firebase_db.reference("56214328/config") # 假設 56214328 是您的設備 ID
+        feedback_ref = firebase_db.reference("56214328/config") 
         
         if future_val > 7.0:
-            # 情況 A：預測未來污染嚴重
+            # 情況 A：預測未來污染嚴重 -> 要求 ESP32 加密監控
             feedback_ref.update({
-                "sample_rate_min": 10,     # 加密採集頻率 (從 60min 變 10min)
-                "alert_mode": True,        # 開啟強迫警報模式
+                "sample_rate_min": 10,     
+                "alert_mode": True,        
                 "system_msg": "AI_PREDICT_HIGH_RISK"
             })
-            print(f"⚠️ [Feedback] 警告！未來風險高，已下發「加密採集」指令至設備")
-        else:
-            # 情況 B：未來環境安全
+            print(f"⚠️ [Feedback] 警告！未來風險高，已下發「加密採集(10min)」指令至設備")
+        elif current_avg > 5.0 and future_val > current_avg:
+             # 情況 B：污染正在快速惡化 -> 提前進入警戒
             feedback_ref.update({
-                "sample_rate_min": 60,     # 恢復正常頻率
+                "sample_rate_min": 30,     
+                "alert_mode": False,        
+                "system_msg": "AI_PREDICT_DETERIORATING"
+            })
+            print(f"📈 [Feedback] 污染趨勢上升中，已下發「警戒模式(30min)」指令至設備")
+        else:
+            # 情況 C：未來環境安全
+            feedback_ref.update({
+                "sample_rate_min": 60,     
                 "alert_mode": False,
                 "system_msg": "AI_PREDICT_NORMAL"
             })
-            print(f"✅ [Feedback] 未來環境穩定，設備維持低功耗模式")
+            print(f"✅ [Feedback] 預期環境穩定，維持標準低功耗模式(60min)")
+        print("-" * 40)
 
     except Exception as e:
         print(f"❌ [WAN] 運行時出錯: {e}")
 
 # ==========================================
-# 4. 啟動服務
+# 5. 啟動服務
 # ==========================================
 def start_services():
     print("🌐 [System] 正在連接 Firebase 服務...")
@@ -170,7 +210,6 @@ def start_services():
     
     init_ai_engine()
     
-    # 啟動監聽器
     print("👂 [Listener] 正在開啟 Firebase 即時監聽隊列...")
     firebase_db.reference("GAGNN_24hours/GAGNN_data").listen(handle_wan_data)
 
@@ -180,12 +219,11 @@ def health_check():
         "status": "online",
         "engine": "GAGNN-Pro-Hybrid",
         "device_target": "56214328",
-        "last_ping": datetime.datetime.now().isoformat()
+        "last_ping": datetime.datetime.now(datetime.UTC).isoformat() + "Z"
     })
 
 if __name__ == "__main__":
     start_services()
-    # Render 部署使用端口 10000
     port = int(os.environ.get("PORT", 10000))
     print(f"📡 [Flask] API 服務正在啟動於 Port {port}...")
     app.run(host='0.0.0.0', port=port)
