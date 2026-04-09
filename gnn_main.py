@@ -104,8 +104,8 @@ def health_check():
         "last_ping": datetime.datetime.now(datetime.UTC).isoformat() + "Z"
     })
 
-@app.route('/predict', methods=['POST'])
-def predict_api():
+@app.route('/predict', methods=['POST']) # 必須是 /predict
+def predict():
     """供 GitHub Action 主動調用的預測接口"""
     if wan_model is None:
         return jsonify({"error": "AI Model not initialized"}), 500
@@ -202,4 +202,4 @@ if __name__ == "__main__":
     start_services()
     port = int(os.environ.get("PORT", 10000))
     print(f"📡 [Flask] API 服務正在啟動於 Port {port}...")
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=10000)
