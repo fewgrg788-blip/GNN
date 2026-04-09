@@ -8,6 +8,7 @@ from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from flask import Flask, jsonify, request
+import threading # 導入線程模組
 
 # --- [1. 環境與模型架構導入] ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -199,7 +200,16 @@ def start_services():
     firebase_db.reference("GAGNN_24hours/GAGNN_data").listen(handle_wan_data)
 
 if __name__ == "__main__":
-    start_services()
+    # 1. 先初始化數據與模型
+    init_ai_engine() 
+    
+    # 2. 將 Firebase 監聽器放在背景線程跑，不要擋住 Flask
+    print("📡 [System] 啟動 Firebase 背景監聽器...")
+    fb_thread = threading.Thread(target=start_services, daemon=True)
+    fb_thread.start()
+    
+    # 3. 啟動 Flask API (這是主進程)
     port = int(os.environ.get("PORT", 10000))
-    print(f"📡 [Flask] API 服務正在啟動於 Port {port}...")
-    app.run(host='0.0.0.0', port=10000)
+    print(f"🚀 [Flask] API 服務正在啟動於 Port {port}...")
+    # 注意：在 Render 部署時，必須使用 os.environ.get("PORT")
+    app.run(host='0.0.0.0', port=port)
